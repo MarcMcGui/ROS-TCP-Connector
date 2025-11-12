@@ -57,13 +57,13 @@ namespace Unity.Robotics.ROSTCPConnector
         }
     }
 
-    private struct SysCommand_ActionRegistration
+    public struct SysCommand_ActionRegistration
     {
         public string action_name;   // e.g. "/unity_fibonacci"
         public string action_type;   // e.g. "example_interfaces/Fibonacci"
     }
 
-    private struct SysCommand_ActionWithGoalId
+    public struct SysCommand_ActionWithGoalId
     {
         public string action_name;
         public string goal_id;       // stringified UUID
