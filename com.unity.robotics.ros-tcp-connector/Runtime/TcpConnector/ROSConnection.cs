@@ -65,6 +65,15 @@ namespace Unity.Robotics.ROSTCPConnector
         internal HudPanel m_HudPanel = null;
         public HudPanel HUDPanel => m_HudPanel;
 
+        private class ActionHandlers
+        {
+            // (goal_id, raw_bytes)
+            public Action<string, byte[]> OnFeedbackBytes;
+            public Action<string, byte[]> OnResultBytes;
+        }
+
+        private readonly Dictionary<string, ActionHandlers> m_ActionHandlers = new Dictionary<string, ActionHandlers>();
+
         class OutgoingMessageQueue
         {
             ConcurrentQueue<OutgoingMessageSender> m_OutgoingMessageQueue;
@@ -363,6 +372,80 @@ namespace Unity.Robotics.ROSTCPConnector
             RosTopicState info = GetOrCreateTopic(topic, requestMessageName, isService: true);
             int resolvedQueueSize = queueSize.GetValueOrDefault(k_DefaultPublisherQueueSize);
             info.RegisterRosService(responseMessageName, resolvedQueueSize);
+        }
+
+        public void RegisterRosActionClient(string actionName, string actionType)
+        {
+            QueueSysCommand("__ros_action", new SysCommand_ActionRegistration
+            {
+                action_name = actionName,
+                action_type = actionType
+            });
+        }
+
+        public string SendActionGoal<TGoal>(string actionName, TGoal goal, string goalId = null)
+            where TGoal : Message
+        {
+            if (string.IsNullOrEmpty(goalId))
+                goalId = Guid.NewGuid().ToString();
+
+            // 1) Tell endpoint a goal is coming
+            QueueSysCommand("__action_goal", new SysCommand_ActionWithGoalId
+            {
+                action_name = actionName,
+                goal_id = goalId
+            });
+
+            // 2) Send the goal payload as a normal framed message to `actionName`.
+            // We ensure a publisher exists for `actionName` with the goal's ROS type,
+            // then publish once. (Safe if re-called; duplicate registration is harmless.)
+            try
+            {
+                RegisterPublisher<TGoal>(actionName, 1, false);
+            }
+            catch { /* already registered */ }
+
+            Publish(actionName, goal);
+            return goalId;
+        }
+
+        public void CancelActionGoal(string actionName, string goalId)
+        {
+            QueueSysCommand("__action_cancel", new SysCommand_ActionWithGoalId
+            {
+                action_name = actionName,
+                goal_id = goalId
+            });
+        }
+
+        public void ListenForAction<TFeedback, TResult>(
+            string actionName,
+            Action<string, TFeedback> onFeedback,   // (goal_id, message)
+            Action<string, TResult> onResult)       // (goal_id, message)
+            where TFeedback : Message
+            where TResult   : Message
+        {
+            m_ActionHandlers[actionName] = new ActionHandlers
+            {
+                OnFeedbackBytes = (goalId, bytes) =>
+                {
+                    try
+                    {
+                        var msg = m_MessageDeserializer.DeserializeMessage<TFeedback>(bytes);
+                        onFeedback?.Invoke(goalId, msg);
+                    }
+                    catch (Exception ex) { Debug.LogException(ex); }
+                },
+                OnResultBytes = (goalId, bytes) =>
+                {
+                    try
+                    {
+                        var msg = m_MessageDeserializer.DeserializeMessage<TResult>(bytes);
+                        onResult?.Invoke(goalId, msg);
+                    }
+                    catch (Exception ex) { Debug.LogException(ex); }
+                }
+            };
         }
 
         [Obsolete("Calling ImplementUnityService now implicitly registers it")]
@@ -742,7 +825,54 @@ namespace Unity.Robotics.ROSTCPConnector
                             m_TopicsListCallbacks.Clear();
                         }
                     }
+
                     break;
+                case "__action_feedback":
+                {
+                    var info = JsonUtility.FromJson<SysCommand_ActionWithGoalId>(json);
+                    // Next message will be the Feedback payload addressed to `info.action_name`
+                    m_SpecialIncomingMessageHandler = (string destination, byte[] payload) =>
+                    {
+                        m_SpecialIncomingMessageHandler = null;
+                        if (!m_ActionHandlers.TryGetValue(info.action_name, out var h) || h.OnFeedbackBytes == null)
+                        {
+                            Debug.LogWarning($"No action feedback listener for {info.action_name} (goal {info.goal_id}).");
+                            return;
+                        }
+                        h.OnFeedbackBytes.Invoke(info.goal_id, payload);
+                    };
+                    break;
+                }
+                case "__action_result":
+                {
+                    var info = JsonUtility.FromJson<SysCommand_ActionWithGoalId>(json);
+                    // Next message will be the Result payload addressed to `info.action_name`
+                    m_SpecialIncomingMessageHandler = (string destination, byte[] payload) =>
+                    {
+                        m_SpecialIncomingMessageHandler = null;
+                        if (!m_ActionHandlers.TryGetValue(info.action_name, out var h) || h.OnResultBytes == null)
+                        {
+                            Debug.LogWarning($"No action result listener for {info.action_name} (goal {info.goal_id}).");
+                            return;
+                        }
+                        h.OnResultBytes.Invoke(info.goal_id, payload);
+                    };
+                    break;
+                }
+                case "__action_goal_request":
+                {
+                    // This is only relevant if you later add a Unity-side Action *server*.
+                    // For now, consume the following payload (the Goal) and log it so the queue stays aligned.
+                    var info = JsonUtility.FromJson<SysCommand_ActionWithGoalId>(json);
+                    m_SpecialIncomingMessageHandler = (string destination, byte[] payload) =>
+                    {
+                        m_SpecialIncomingMessageHandler = null;
+                        Debug.LogWarning($"Received __action_goal_request for {info.action_name} (goal {info.goal_id}) " +
+                                        $"but no server-side handler is registered.");
+                        // If you implement a server, deserialize payload here as the Goal and start execution.
+                    };
+                    break;
+                }
             }
         }
 
