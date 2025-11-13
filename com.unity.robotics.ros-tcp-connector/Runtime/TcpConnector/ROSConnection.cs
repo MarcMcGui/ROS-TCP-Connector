@@ -430,6 +430,7 @@ namespace Unity.Robotics.ROSTCPConnector
 
         public void RegisterRosActionClient(string actionName, string actionType)
         {
+            Debug.Log($"RegisterRosActionClient: actionName='{actionName}', actionType='{actionType}'");
             QueueSysCommand("__ros_action", new SysCommand_ActionRegistration
             {
                 action_name = actionName,
@@ -463,8 +464,14 @@ namespace Unity.Robotics.ROSTCPConnector
             // preventing "Failed to resolve" errors when SendActionGoal() is later called
             try
             {
+                // Diagnostic: log the ROS message names that will be sent to the endpoint
+                string goalName = MessageRegistry.GetRosMessageName<TGoal>();
+                string feedbackName = MessageRegistry.GetRosMessageName<TFeedback>();
+                string resultName = MessageRegistry.GetRosMessageName<TResult>();
+                Debug.Log($"PreRegisterActionTypes for action '{actionName}' -> Goal: '{goalName}', Feedback: '{feedbackName}', Result: '{resultName}'");
+
                 RegisterPublisher<TGoal>(actionName, 1, false);
-                Debug.Log($"Pre-registered action goal type: {MessageRegistry.GetRosMessageName<TGoal>()}");
+                Debug.Log($"Pre-registered action goal type: {goalName}");
             }
             catch (Exception ex)
             {
