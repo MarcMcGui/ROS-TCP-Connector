@@ -10,6 +10,7 @@ using UnityEngine.Serialization;
 using System.Collections.Concurrent;
 using System.Threading;
 using System.Linq;
+using Unity.Robotics.ROSTCPConnector;
 
 namespace Unity.Robotics.ROSTCPConnector
 {
