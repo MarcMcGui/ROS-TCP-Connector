@@ -89,7 +89,7 @@ namespace Unity.Robotics.ROSTCPConnector
                     }
                 };
 
-            m_Connection.ImplementRosActionServer(
+            m_Connection.ImplementRosActionServer<TGoal, TResult, TFeedback>(
                 m_ActionName,
                 wrappedHandler,
                 m_OnCancelRequested);

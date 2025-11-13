@@ -534,11 +534,11 @@ namespace Unity.Robotics.ROSTCPConnector
         /// <typeparam name="TResult">The result message type.</typeparam>
         /// <typeparam name="TFeedback">The feedback message type.</typeparam>
         /// <param name="actionName">The name of the action (e.g., "/fibonacci").</param>
-        /// <param name="onGoalReceived">Callback when a goal is received. Should return a GoalHandle.</param>
+        /// <param name="onGoalReceived">Callback when a goal is received. Takes (goalId, goalBytes) and should return a GoalHandle.</param>
         /// <param name="onCancelRequested">Optional callback when cancellation is requested.</param>
         public void ImplementRosActionServer<TGoal, TResult, TFeedback>(
             string actionName,
-            Func<string, TGoal, GoalHandle<TGoal, TFeedback, TResult>> onGoalReceived,
+            Func<string, byte[], GoalHandle<TGoal, TFeedback, TResult>> onGoalReceived,
             Action<string> onCancelRequested = null)
             where TGoal : Message
             where TResult : Message
