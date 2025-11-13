@@ -69,6 +69,26 @@ namespace Unity.Robotics.ROSTCPConnector
         public string goal_id;       // stringified UUID
     }
 
+    public struct SysCommand_ActionFeedback
+    {
+        public string action_name;
+        public string goal_id;
+    }
+
+    public struct SysCommand_ActionResult
+    {
+        public string action_name;
+        public string goal_id;
+        public int status;           // GoalStatus enum value
+    }
+
+    public struct SysCommand_ActionStatusUpdate
+    {
+        public string action_name;
+        public string goal_id;
+        public int status;           // GoalStatus enum value
+    }
+
     public struct SysCommand_Topic
     {
         public string topic;

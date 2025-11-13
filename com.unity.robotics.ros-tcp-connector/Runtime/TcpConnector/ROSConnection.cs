@@ -67,12 +67,65 @@ namespace Unity.Robotics.ROSTCPConnector
 
         private class ActionHandlers
         {
-            // (goal_id, raw_bytes)
-            public Action<string, byte[]> OnFeedbackBytes;
-            public Action<string, byte[]> OnResultBytes;
+            public readonly List<Action<string, byte[]>> FeedbackCallbacks = new List<Action<string, byte[]>>();
+            public readonly List<Action<string, byte[]>> ResultCallbacks = new List<Action<string, byte[]>>();
+
+            public bool HasFeedbackListeners => FeedbackCallbacks.Count > 0;
+            public bool HasResultListeners => ResultCallbacks.Count > 0;
+            public bool IsEmpty => FeedbackCallbacks.Count == 0 && ResultCallbacks.Count == 0;
+        }
+
+        private class ActionServerHandlers
+        {
+            public Delegate GoalHandler;  // Func<string, byte[], Task<bool>> - returns true if goal accepted
+            public Action<string> CancelHandler;  // Action<string> - goalId
         }
 
         private readonly Dictionary<string, ActionHandlers> m_ActionHandlers = new Dictionary<string, ActionHandlers>();
+        readonly object m_ActionHandlersLock = new object();
+
+        private readonly Dictionary<string, ActionServerHandlers> m_ActionServerHandlers = new Dictionary<string, ActionServerHandlers>();
+        readonly object m_ActionServerHandlersLock = new object();
+
+        // Tracks active goals for action servers
+        private readonly Dictionary<string, Dictionary<string, object>> m_ActiveServerGoals = new Dictionary<string, Dictionary<string, object>>();
+        readonly object m_ActiveServerGoalsLock = new object();
+
+        private sealed class ActionListenerRegistration : IDisposable
+        {
+            readonly ROSConnection m_Owner;
+            readonly string m_ActionName;
+            readonly Action<string, byte[]> m_Feedback;
+            readonly Action<string, byte[]> m_Result;
+            bool m_Disposed;
+
+            public ActionListenerRegistration(
+                ROSConnection owner,
+                string actionName,
+                Action<string, byte[]> feedback,
+                Action<string, byte[]> result)
+            {
+                m_Owner = owner;
+                m_ActionName = actionName;
+                m_Feedback = feedback;
+                m_Result = result;
+            }
+
+            public void Dispose()
+            {
+                if (m_Disposed)
+                    return;
+
+                m_Disposed = true;
+                m_Owner.UnregisterActionHandlers(m_ActionName, m_Feedback, m_Result);
+            }
+        }
+
+        private sealed class NullActionListenerRegistration : IDisposable
+        {
+            public static readonly NullActionListenerRegistration Instance = new NullActionListenerRegistration();
+            public void Dispose() { }
+        }
 
         class OutgoingMessageQueue
         {
@@ -383,6 +436,61 @@ namespace Unity.Robotics.ROSTCPConnector
             });
         }
 
+        /// <summary>
+        /// Pre-registers all action message types (Goal, Feedback, Result) with the endpoint.
+        /// 
+        /// CRITICAL: Call this BEFORE SendActionGoal() to avoid endpoint message resolution errors.
+        /// This ensures the endpoint has imported and validated all message types before you try to use them.
+        /// 
+        /// Without this, you may get errors like:
+        /// "Failed to resolve your_msgs/YourGoal: module 'your_msgs.msg' has no attribute 'YourGoal'"
+        /// </summary>
+        /// <typeparam name="TGoal">The goal message type.</typeparam>
+        /// <typeparam name="TFeedback">The feedback message type.</typeparam>
+        /// <typeparam name="TResult">The result message type.</typeparam>
+        /// <param name="actionName">The action name (e.g., "/fibonacci").</param>
+        public void PreRegisterActionTypes<TGoal, TFeedback, TResult>(string actionName)
+            where TGoal : Message
+            where TFeedback : Message
+            where TResult : Message
+        {
+            if (string.IsNullOrEmpty(actionName))
+                throw new ArgumentException("actionName cannot be null or empty.", nameof(actionName));
+
+            // Pre-register all three message types by creating publishers for them
+            // This forces the endpoint to import and validate the message types upfront,
+            // preventing "Failed to resolve" errors when SendActionGoal() is later called
+            try
+            {
+                RegisterPublisher<TGoal>(actionName, 1, false);
+                Debug.Log($"Pre-registered action goal type: {MessageRegistry.GetRosMessageName<TGoal>()}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"Failed to pre-register goal type for {actionName}: {ex.Message}");
+            }
+
+            try
+            {
+                RegisterPublisher<TFeedback>(actionName, 1, false);
+                Debug.Log($"Pre-registered action feedback type: {MessageRegistry.GetRosMessageName<TFeedback>()}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"Failed to pre-register feedback type for {actionName}: {ex.Message}");
+            }
+
+            try
+            {
+                RegisterPublisher<TResult>(actionName, 1, false);
+                Debug.Log($"Pre-registered action result type: {MessageRegistry.GetRosMessageName<TResult>()}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"Failed to pre-register result type for {actionName}: {ex.Message}");
+            }
+        }
+
         public string SendActionGoal<TGoal>(string actionName, TGoal goal, string goalId = null)
             where TGoal : Message
         {
@@ -418,6 +526,178 @@ namespace Unity.Robotics.ROSTCPConnector
             });
         }
 
+        /// <summary>
+        /// Implements a ROS2 action server in Unity.
+        /// </summary>
+        /// <typeparam name="TGoal">The goal message type.</typeparam>
+        /// <typeparam name="TResult">The result message type.</typeparam>
+        /// <typeparam name="TFeedback">The feedback message type.</typeparam>
+        /// <param name="actionName">The name of the action (e.g., "/fibonacci").</param>
+        /// <param name="onGoalReceived">Callback when a goal is received. Should return a GoalHandle.</param>
+        /// <param name="onCancelRequested">Optional callback when cancellation is requested.</param>
+        public void ImplementRosActionServer<TGoal, TResult, TFeedback>(
+            string actionName,
+            Func<string, TGoal, GoalHandle<TGoal, TFeedback, TResult>> onGoalReceived,
+            Action<string> onCancelRequested = null)
+            where TGoal : Message
+            where TResult : Message
+            where TFeedback : Message
+        {
+            if (string.IsNullOrEmpty(actionName))
+                throw new ArgumentException("actionName cannot be null or empty.", nameof(actionName));
+            if (onGoalReceived == null)
+                throw new ArgumentNullException(nameof(onGoalReceived));
+
+            lock (m_ActionServerHandlersLock)
+            {
+                if (!m_ActionServerHandlers.TryGetValue(actionName, out var handlers))
+                {
+                    handlers = new ActionServerHandlers();
+                    m_ActionServerHandlers[actionName] = handlers;
+                }
+
+                handlers.GoalHandler = onGoalReceived;
+                handlers.CancelHandler = onCancelRequested;
+            }
+
+            lock (m_ActiveServerGoalsLock)
+            {
+                if (!m_ActiveServerGoals.ContainsKey(actionName))
+                {
+                    m_ActiveServerGoals[actionName] = new Dictionary<string, object>();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Sends feedback for an active goal on an action server.
+        /// </summary>
+        public void SendActionFeedback<TFeedback>(string actionName, string goalId, TFeedback feedback)
+            where TFeedback : Message
+        {
+            if (string.IsNullOrEmpty(actionName))
+                throw new ArgumentException("actionName cannot be null or empty.", nameof(actionName));
+            if (string.IsNullOrEmpty(goalId))
+                throw new ArgumentException("goalId cannot be null or empty.", nameof(goalId));
+            if (feedback == null)
+                throw new ArgumentNullException(nameof(feedback));
+
+            QueueSysCommand("__action_feedback", new SysCommand_ActionFeedback
+            {
+                action_name = actionName,
+                goal_id = goalId
+            });
+
+            // Send the feedback message as the next payload
+            RosTopicState topicState = GetOrCreateTopic(actionName, feedback.RosMessageName);
+            topicState.Publish(feedback);
+        }
+
+        /// <summary>
+        /// Sends the result of a completed goal.
+        /// </summary>
+        public void SendActionResult<TResult>(string actionName, string goalId, GoalStatus status, TResult result)
+            where TResult : Message
+        {
+            if (string.IsNullOrEmpty(actionName))
+                throw new ArgumentException("actionName cannot be null or empty.", nameof(actionName));
+            if (string.IsNullOrEmpty(goalId))
+                throw new ArgumentException("goalId cannot be null or empty.", nameof(goalId));
+            if (result == null)
+                throw new ArgumentNullException(nameof(result));
+
+            QueueSysCommand("__action_result", new SysCommand_ActionResult
+            {
+                action_name = actionName,
+                goal_id = goalId,
+                status = (int)status
+            });
+
+            // Send the result message as the next payload
+            RosTopicState topicState = GetOrCreateTopic(actionName, result.RosMessageName);
+            topicState.Publish(result);
+
+            // Clean up the goal from active goals
+            lock (m_ActiveServerGoalsLock)
+            {
+                if (m_ActiveServerGoals.TryGetValue(actionName, out var goals))
+                {
+                    goals.Remove(goalId);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Updates the status of an active goal (for servers).
+        /// </summary>
+        public void UpdateActionGoalStatus(string actionName, string goalId, GoalStatus status)
+        {
+            if (string.IsNullOrEmpty(actionName))
+                throw new ArgumentException("actionName cannot be null or empty.", nameof(actionName));
+            if (string.IsNullOrEmpty(goalId))
+                throw new ArgumentException("goalId cannot be null or empty.", nameof(goalId));
+
+            QueueSysCommand("__action_status", new SysCommand_ActionStatusUpdate
+            {
+                action_name = actionName,
+                goal_id = goalId,
+                status = (int)status
+            });
+        }
+
+        internal IDisposable RegisterActionHandlers(
+            string actionName,
+            Action<string, byte[]> onFeedbackBytes,
+            Action<string, byte[]> onResultBytes)
+        {
+            if (string.IsNullOrEmpty(actionName))
+                throw new ArgumentException("actionName cannot be null or empty.", nameof(actionName));
+
+            if (onFeedbackBytes == null && onResultBytes == null)
+                return NullActionListenerRegistration.Instance;
+
+            lock (m_ActionHandlersLock)
+            {
+                if (!m_ActionHandlers.TryGetValue(actionName, out var handlers))
+                {
+                    handlers = new ActionHandlers();
+                    m_ActionHandlers[actionName] = handlers;
+                }
+
+                if (onFeedbackBytes != null)
+                    handlers.FeedbackCallbacks.Add(onFeedbackBytes);
+
+                if (onResultBytes != null)
+                    handlers.ResultCallbacks.Add(onResultBytes);
+            }
+
+            return new ActionListenerRegistration(this, actionName, onFeedbackBytes, onResultBytes);
+        }
+
+        void UnregisterActionHandlers(
+            string actionName,
+            Action<string, byte[]> onFeedbackBytes,
+            Action<string, byte[]> onResultBytes)
+        {
+            if (string.IsNullOrEmpty(actionName))
+                return;
+
+            lock (m_ActionHandlersLock)
+            {
+                if (!m_ActionHandlers.TryGetValue(actionName, out var handlers))
+                    return;
+
+                if (onFeedbackBytes != null)
+                    handlers.FeedbackCallbacks.Remove(onFeedbackBytes);
+
+                if (onResultBytes != null)
+                    handlers.ResultCallbacks.Remove(onResultBytes);
+
+                if (handlers.IsEmpty)
+                    m_ActionHandlers.Remove(actionName);
+            }
+        }
+
         public void ListenForAction<TFeedback, TResult>(
             string actionName,
             Action<string, TFeedback> onFeedback,   // (goal_id, message)
@@ -425,9 +705,10 @@ namespace Unity.Robotics.ROSTCPConnector
             where TFeedback : Message
             where TResult   : Message
         {
-            m_ActionHandlers[actionName] = new ActionHandlers
+            Action<string, byte[]> feedbackWrapper = null;
+            if (onFeedback != null)
             {
-                OnFeedbackBytes = (goalId, bytes) =>
+                feedbackWrapper = (goalId, bytes) =>
                 {
                     try
                     {
@@ -435,8 +716,13 @@ namespace Unity.Robotics.ROSTCPConnector
                         onFeedback?.Invoke(goalId, msg);
                     }
                     catch (Exception ex) { Debug.LogException(ex); }
-                },
-                OnResultBytes = (goalId, bytes) =>
+                };
+            }
+
+            Action<string, byte[]> resultWrapper = null;
+            if (onResult != null)
+            {
+                resultWrapper = (goalId, bytes) =>
                 {
                     try
                     {
@@ -444,8 +730,20 @@ namespace Unity.Robotics.ROSTCPConnector
                         onResult?.Invoke(goalId, msg);
                     }
                     catch (Exception ex) { Debug.LogException(ex); }
-                }
-            };
+                };
+            }
+
+            RegisterActionHandlers(actionName, feedbackWrapper, resultWrapper);
+        }
+
+        public RosActionClient<TGoal, TFeedback, TResult> CreateActionClient<TGoal, TFeedback, TResult>(
+            string actionName,
+            string actionType)
+            where TGoal : Message
+            where TFeedback : Message
+            where TResult : Message
+        {
+            return new RosActionClient<TGoal, TFeedback, TResult>(this, actionName, actionType);
         }
 
         [Obsolete("Calling ImplementUnityService now implicitly registers it")]
@@ -834,12 +1132,29 @@ namespace Unity.Robotics.ROSTCPConnector
                     m_SpecialIncomingMessageHandler = (string destination, byte[] payload) =>
                     {
                         m_SpecialIncomingMessageHandler = null;
-                        if (!m_ActionHandlers.TryGetValue(info.action_name, out var h) || h.OnFeedbackBytes == null)
+                        Action<string, byte[]>[] callbacks = null;
+                        lock (m_ActionHandlersLock)
+                        {
+                            if (m_ActionHandlers.TryGetValue(info.action_name, out var h) && h.HasFeedbackListeners)
+                            {
+                                callbacks = h.FeedbackCallbacks.ToArray();
+                            }
+                        }
+
+                        if (callbacks == null || callbacks.Length == 0)
                         {
                             Debug.LogWarning($"No action feedback listener for {info.action_name} (goal {info.goal_id}).");
                             return;
                         }
-                        h.OnFeedbackBytes.Invoke(info.goal_id, payload);
+
+                        foreach (var callback in callbacks)
+                        {
+                            try
+                            {
+                                callback(info.goal_id, payload);
+                            }
+                            catch (Exception ex) { Debug.LogException(ex); }
+                        }
                     };
                     break;
                 }
@@ -850,27 +1165,98 @@ namespace Unity.Robotics.ROSTCPConnector
                     m_SpecialIncomingMessageHandler = (string destination, byte[] payload) =>
                     {
                         m_SpecialIncomingMessageHandler = null;
-                        if (!m_ActionHandlers.TryGetValue(info.action_name, out var h) || h.OnResultBytes == null)
+                        Action<string, byte[]>[] callbacks = null;
+                        lock (m_ActionHandlersLock)
+                        {
+                            if (m_ActionHandlers.TryGetValue(info.action_name, out var h) && h.HasResultListeners)
+                            {
+                                callbacks = h.ResultCallbacks.ToArray();
+                            }
+                        }
+
+                        if (callbacks == null || callbacks.Length == 0)
                         {
                             Debug.LogWarning($"No action result listener for {info.action_name} (goal {info.goal_id}).");
                             return;
                         }
-                        h.OnResultBytes.Invoke(info.goal_id, payload);
+
+                        foreach (var callback in callbacks)
+                        {
+                            try
+                            {
+                                callback(info.goal_id, payload);
+                            }
+                            catch (Exception ex) { Debug.LogException(ex); }
+                        }
                     };
                     break;
                 }
                 case "__action_goal_request":
                 {
-                    // This is only relevant if you later add a Unity-side Action *server*.
-                    // For now, consume the following payload (the Goal) and log it so the queue stays aligned.
+                    // This is relevant for Unity-side Action servers.
                     var info = JsonUtility.FromJson<SysCommand_ActionWithGoalId>(json);
                     m_SpecialIncomingMessageHandler = (string destination, byte[] payload) =>
                     {
                         m_SpecialIncomingMessageHandler = null;
-                        Debug.LogWarning($"Received __action_goal_request for {info.action_name} (goal {info.goal_id}) " +
-                                        $"but no server-side handler is registered.");
-                        // If you implement a server, deserialize payload here as the Goal and start execution.
+                        
+                        ActionServerHandlers handlers = null;
+                        lock (m_ActionServerHandlersLock)
+                        {
+                            m_ActionServerHandlers.TryGetValue(info.action_name, out handlers);
+                        }
+
+                        if (handlers == null || handlers.GoalHandler == null)
+                        {
+                            Debug.LogWarning($"Received __action_goal_request for {info.action_name} (goal {info.goal_id}) " +
+                                            $"but no server-side handler is registered.");
+                            return;
+                        }
+
+                        // Track this as an active goal
+                        lock (m_ActiveServerGoalsLock)
+                        {
+                            if (!m_ActiveServerGoals.TryGetValue(info.action_name, out var goals))
+                            {
+                                goals = new Dictionary<string, object>();
+                                m_ActiveServerGoals[info.action_name] = goals;
+                            }
+                            goals[info.goal_id] = payload; // Store the payload for reference
+                        }
+
+                        // Invoke the handler - it should deserialize and return a GoalHandle
+                        try
+                        {
+                            var method = handlers.GoalHandler;
+                            method.DynamicInvoke(info.goal_id, payload);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.LogException(ex);
+                        }
                     };
+                    break;
+                }
+                case "__action_cancel_request":
+                {
+                    var info = JsonUtility.FromJson<SysCommand_ActionWithGoalId>(json);
+                    
+                    ActionServerHandlers handlers = null;
+                    lock (m_ActionServerHandlersLock)
+                    {
+                        m_ActionServerHandlers.TryGetValue(info.action_name, out handlers);
+                    }
+
+                    if (handlers?.CancelHandler != null)
+                    {
+                        try
+                        {
+                            handlers.CancelHandler(info.goal_id);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.LogException(ex);
+                        }
+                    }
                     break;
                 }
             }
