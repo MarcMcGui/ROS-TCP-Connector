@@ -573,7 +573,42 @@ namespace Unity.Robotics.ROSTCPConnector
                     m_ActionServerHandlers[actionName] = handlers;
                 }
 
-                handlers.GoalHandler = onGoalReceived;
+                handlers.GoalHandler = onGoalReceived; // typed goal handler
+                handlers.CancelHandler = onCancelRequested;
+            }
+
+            lock (m_ActiveServerGoalsLock)
+            {
+                if (!m_ActiveServerGoals.ContainsKey(actionName))
+                {
+                    m_ActiveServerGoals[actionName] = new Dictionary<string, object>();
+                }
+            }
+        }
+
+        // Backwards-compatible overload: byte[] payload handler, used by RosActionServer package code
+        public void ImplementRosActionServer<TGoal, TResult, TFeedback>(
+            string actionName,
+            Func<string, byte[], GoalHandle<TGoal, TFeedback, TResult>> onGoalReceived,
+            Action<string> onCancelRequested = null)
+            where TGoal : Message
+            where TResult : Message
+            where TFeedback : Message
+        {
+            if (string.IsNullOrEmpty(actionName))
+                throw new ArgumentException("actionName cannot be null or empty.", nameof(actionName));
+            if (onGoalReceived == null)
+                throw new ArgumentNullException(nameof(onGoalReceived));
+
+            lock (m_ActionServerHandlersLock)
+            {
+                if (!m_ActionServerHandlers.TryGetValue(actionName, out var handlers))
+                {
+                    handlers = new ActionServerHandlers();
+                    m_ActionServerHandlers[actionName] = handlers;
+                }
+
+                handlers.GoalHandler = onGoalReceived; // byte[] payload handler
                 handlers.CancelHandler = onCancelRequested;
             }
 
