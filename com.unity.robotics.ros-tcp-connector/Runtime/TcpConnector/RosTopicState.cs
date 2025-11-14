@@ -202,6 +202,7 @@ namespace Unity.Robotics.ROSTCPConnector
                 Debug.LogWarning($"Publisher for topic {m_Topic} registered twice!");
                 return;
             }
+            Debug.Log($"RegisterPublisher called for topic '{m_Topic}' with message '{m_RosMessageName}' (queue={queueSize}, latch={latch})");
             IsPublisher = true;
             IsPublisherLatched = latch;
             m_ConnectionInternal.SendPublisherRegistration(m_Topic, m_RosMessageName, queueSize, latch);

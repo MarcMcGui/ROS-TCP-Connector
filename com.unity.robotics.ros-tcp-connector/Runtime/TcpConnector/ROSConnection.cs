@@ -88,6 +88,10 @@ namespace Unity.Robotics.ROSTCPConnector
         private readonly Dictionary<string, ActionServerHandlers> m_ActionServerHandlers = new Dictionary<string, ActionServerHandlers>();
         readonly object m_ActionServerHandlersLock = new object();
 
+    // Track ROS action client registrations so we can re-send them on reconnects
+    private readonly Dictionary<string, string> m_RosActionRegistrations = new Dictionary<string, string>(); // actionName -> actionType
+    readonly object m_RosActionRegistrationsLock = new object();
+
         // Tracks active goals for action servers
         private readonly Dictionary<string, Dictionary<string, object>> m_ActiveServerGoals = new Dictionary<string, Dictionary<string, object>>();
         readonly object m_ActiveServerGoalsLock = new object();
@@ -430,7 +434,18 @@ namespace Unity.Robotics.ROSTCPConnector
 
         public void RegisterRosActionClient(string actionName, string actionType)
         {
-            Debug.Log($"RegisterRosActionClient: actionName='{actionName}', actionType='{actionType}'");
+            if (string.IsNullOrEmpty(actionName))
+                throw new ArgumentException("actionName cannot be null or empty.", nameof(actionName));
+            if (string.IsNullOrEmpty(actionType))
+                throw new ArgumentException("actionType cannot be null or empty.", nameof(actionType));
+
+            // Remember registration so we can re-register after reconnects
+            lock (m_RosActionRegistrationsLock)
+            {
+                m_RosActionRegistrations[actionName] = actionType;
+            }
+
+            Debug.Log($"[ROSConnection] RegisterRosActionClient queued: name='{actionName}', type='{actionType}'");
             QueueSysCommand("__ros_action", new SysCommand_ActionRegistration
             {
                 action_name = actionName,
@@ -464,14 +479,8 @@ namespace Unity.Robotics.ROSTCPConnector
             // preventing "Failed to resolve" errors when SendActionGoal() is later called
             try
             {
-                // Diagnostic: log the ROS message names that will be sent to the endpoint
-                string goalName = MessageRegistry.GetRosMessageName<TGoal>();
-                string feedbackName = MessageRegistry.GetRosMessageName<TFeedback>();
-                string resultName = MessageRegistry.GetRosMessageName<TResult>();
-                Debug.Log($"PreRegisterActionTypes for action '{actionName}' -> Goal: '{goalName}', Feedback: '{feedbackName}', Result: '{resultName}'");
-
                 RegisterPublisher<TGoal>(actionName, 1, false);
-                Debug.Log($"Pre-registered action goal type: {goalName}");
+                Debug.Log($"Pre-registered action goal type: {MessageRegistry.GetRosMessageName<TGoal>()}");
             }
             catch (Exception ex)
             {
@@ -541,11 +550,11 @@ namespace Unity.Robotics.ROSTCPConnector
         /// <typeparam name="TResult">The result message type.</typeparam>
         /// <typeparam name="TFeedback">The feedback message type.</typeparam>
         /// <param name="actionName">The name of the action (e.g., "/fibonacci").</param>
-        /// <param name="onGoalReceived">Callback when a goal is received. Takes (goalId, goalBytes) and should return a GoalHandle.</param>
+        /// <param name="onGoalReceived">Callback when a goal is received. Should return a GoalHandle.</param>
         /// <param name="onCancelRequested">Optional callback when cancellation is requested.</param>
         public void ImplementRosActionServer<TGoal, TResult, TFeedback>(
             string actionName,
-            Func<string, byte[], GoalHandle<TGoal, TFeedback, TResult>> onGoalReceived,
+            Func<string, TGoal, GoalHandle<TGoal, TFeedback, TResult>> onGoalReceived,
             Action<string> onCancelRequested = null)
             where TGoal : Message
             where TResult : Message
@@ -918,6 +927,30 @@ namespace Unity.Robotics.ROSTCPConnector
 
             foreach (RosTopicState topicInfo in m_Topics.Values.ToArray())
                 topicInfo.OnConnectionEstablished(stream);
+
+            // Re-register any ROS action clients after the connection is established
+            // (syscommands like __ros_action are not automatically resent via RosTopicState)
+            KeyValuePair<string, string>[] actionsToRegister;
+            lock (m_RosActionRegistrationsLock)
+            {
+                actionsToRegister = m_RosActionRegistrations.ToArray();
+            }
+            foreach (var kv in actionsToRegister)
+            {
+                try
+                {
+                    Debug.Log($"[ROSConnection] Re-registering ROS action client on reconnect: name='{kv.Key}', type='{kv.Value}'");
+                    SendSysCommandImmediate("__ros_action", new SysCommand_ActionRegistration
+                    {
+                        action_name = kv.Key,
+                        action_type = kv.Value
+                    }, stream);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[ROSConnection] Failed to re-register ROS action '{kv.Key}': {ex.Message}");
+                }
+            }
 
             RefreshTopicsList();
         }
